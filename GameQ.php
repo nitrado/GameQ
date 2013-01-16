@@ -471,10 +471,9 @@ class GameQ
                 foreach($servers['challenges'] AS $server_id => $instance)
                 {
                     // Remove non responsive servers
-                    if (is_null($instance->challengeResponse())) {
+                    if ($instance->challengeVerifyAndParse() == FALSE) {
                         unset($servers['info'][$server_id]);
                     }
-                    $instance->challengeVerifyAndParse();
                 }
             }
 
@@ -503,10 +502,9 @@ class GameQ
 			foreach($servers['challenges'] AS $server_id => $instance)
 			{
                                 // Remove non responsive servers
-                                if (is_null($instance->challengeResponse())) {
+				if ($instance->challengeVerifyAndParse() == FALSE) {
                                     unset($servers['info'][$server_id]);
                                 }
-				$instance->challengeVerifyAndParse();
 			}
 		}
 
