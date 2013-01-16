@@ -137,6 +137,7 @@ class GameQ
             // Advanced settings
             'stream_timeout' => 400000, // See http://www.php.net/manual/en/function.stream-select.php for more info
             'packet_delay' => 50000,
+            'max_concurrent_linear_queries' => 5,
         );
 
 	/**
@@ -152,7 +153,15 @@ class GameQ
 	 * @var array
 	 */
 	protected $sockets = array();
-
+        
+        /**
+	 * Holds the list of server ids with the corresponding socket id (@see $sockets) as value.
+         * This array is automaically cleaned as needed.
+	 *
+	 * @var array
+	 */
+        protected $serverIdToSocket = array();
+        
 	/**
 	 * Make new class and check for requirements
 	 *
@@ -387,22 +396,13 @@ class GameQ
 		// Loop thru all of the servers added and categorize them
 		foreach($this->servers AS $server_id => $instance)
 		{
-			// Check to see what kind of server this is and how we can send packets
-			if($instance->packet_mode() == GameQ_Protocols::PACKET_MODE_LINEAR)
-			{
-				$queries['linear'][$server_id] = $instance;
-			}
-			else // We can send this out in a multi request
-			{
-				// Check to see if we should issue a challenge first
-				if($instance->hasChallenge())
-				{
-					$queries['multi']['challenges'][$server_id] = $instance;
-				}
-
-				// Add this instance to do info query
-				$queries['multi']['info'][$server_id] = $instance;
-			}
+                    // Check to see what kind of server this is and how we can send packets
+                    $type = $instance->packet_mode() == GameQ_Protocols::PACKET_MODE_LINEAR ? 'linear' : 'multi';
+                    if($instance->hasChallenge())
+                    {
+                        $queries[$type]['challenges'][$server_id] = $instance;
+                    }
+                    $queries[$type]['info'][$server_id] = $instance;
 		}
 
 		// First lets do the faster, multi queries
@@ -460,69 +460,28 @@ class GameQ
 	 */
 	protected function requestLinear($servers=array())
 	{
-		// Loop thru all the linear servers
-		foreach($servers AS $server_id => $instance)
-		{
-			// First we need to get a socket and we need to block because this is linear
-			if(($socket = $this->socket_open($instance, TRUE)) === FALSE)
-			{
-				// Skip it
-				continue;
-			}
+            // See if we have any challenges to send off
+            if(count($servers['challenges']) > 0)
+            {
+                // Now lets send off all the challenges
+                $this->sendChallenge($servers['challenges'], false);
 
-			// Socket id
-			$socket_id = (int) $socket;
+                // Now let's process the challenges
+                // Loop thru all the instances
+                foreach($servers['challenges'] AS $server_id => $instance)
+                {
+                    // Remove non responsive servers
+                    if (is_null($instance->challengeResponse())) {
+                        unset($servers['info'][$server_id]);
+                    }
+                    $instance->challengeVerifyAndParse();
+                }
+            }
 
-			// See if we have challenges to send off
-			if($instance->hasChallenge())
-			{
-				// Now send off the challenge packet
-				fwrite($socket, $instance->getPacket('challenge'));
-
-				// Read in the challenge response
-				$instance->challengeResponse(array(fread($socket, 4096)));
-
-				// Now we need to parse and apply the challenge response to all the packets that require it
-				$instance->challengeVerifyAndParse();
-			}
-
-			// Invoke the beforeSend method
-			$instance->beforeSend();
-
-			// Grab the packets we need to send, minus the challenge packet
-			$packets = $instance->getPacket('!challenge');
-
-			// Now loop the packets, begin the slowness
-			foreach($packets AS $packet_type => $packet)
-			{
-				// Add the socket information so we can retreive it easily
-				$this->sockets = array(
-					$socket_id => array(
-						'server_id' => $server_id,
-						'packet_type' => $packet_type,
-						'socket' => $socket,
-					)
-				);
-
-				// Write the packet
-				fwrite($socket, $packet);
-
-				// Get the responses from the query
-				$responses = $this->sockets_listen();
-
-				// Lets look at our responses
-				foreach($responses AS $socket_id => $response)
-				{
-					// Save the response from this packet
-					$instance->packetResponse($packet_type, $response);
-				}
-			}
-		}
-
-		// Now close all the socket(s) and clean up any data
-		$this->sockets_close();
-
-		return TRUE;
+            // Send out all the query packets to get data for
+            $this->queryServerInfoLinear($servers['info']);
+            
+            return TRUE;
 	}
 
 	/**
@@ -543,6 +502,10 @@ class GameQ
 			// Loop thru all the instances
 			foreach($servers['challenges'] AS $server_id => $instance)
 			{
+                                // Remove non responsive servers
+                                if (is_null($instance->challengeResponse())) {
+                                    unset($servers['info'][$server_id]);
+                                }
 				$instance->challengeVerifyAndParse();
 			}
 		}
@@ -559,7 +522,7 @@ class GameQ
 	 * @param array $instances
 	 * @return boolean
 	 */
-	protected function sendChallenge(Array $instances=NULL)
+	protected function sendChallenge(Array $instances=NULL, $closeSockets = true)
 	{
 		// Loop thru all the instances we need to send out challenges for
 		foreach($instances AS $server_id => $instance)
@@ -580,11 +543,11 @@ class GameQ
 				'packet_type' => GameQ_Protocols::PACKET_CHALLENGE,
 				'socket' => $socket,
 			);
+                        $this->serverIdToSocket[$server_id] = (int) $socket;
 
 			// Let's sleep shortly so we are not hammering out calls rapid fire style hogging cpu
 			usleep($this->packet_delay);
 		}
-
 		// Now we need to listen for challenge response(s)
 		$responses = $this->sockets_listen();
 
@@ -599,7 +562,8 @@ class GameQ
 		}
 
 		// Now close all the socket(s) and clean up any data
-		$this->sockets_close();
+                if ($closeSockets)
+                    $this->sockets_close();
 
 		return TRUE;
 	}
@@ -672,6 +636,97 @@ class GameQ
 		$this->sockets_close();
 
 		return TRUE;
+	}
+        
+        /**
+	 * Query the server(s) for actual server information (i.e. info, players, rules, etc...)
+         * Linear Mode.
+	 *
+         * The function uses open sockets from challenge requests if available.
+         * Before collecting the responses it queries at least 'max_concurrent_linear_queries' servers.
+         * 
+	 * @param array $instances
+	 * @return boolean
+	 */
+        protected function queryServerInfoLinear(Array $instances=NULL)
+	{
+            $allPackets = array();
+            // Get all the packets we have to sent and open socket
+            foreach($instances AS $server_id => $instance)
+            {
+                // Invoke the beforeSend method
+                $instance->beforeSend();
+
+                // Get all the non-challenge packets we need to send
+                $packets = $instance->getPacket('!challenge');
+                if(count($packets) == 0)
+                {
+                    // Skip nothing else to do for some reason.
+                    continue;
+                }
+                $allPackets[$server_id] = $packets;
+                // Check if we already have a socket open
+                if (isset($this->sockets[$this->serverIdToSocket[$server_id]])) {
+                    continue;
+                }
+                // Make a new socket
+                // This happens if the instance does not have a challenge
+                if(($socket = $this->socket_open($instance, TRUE)) === FALSE)
+                {
+                        // Skip it
+                        continue;
+                }
+                // Add the socket information so we can retreive it easily
+                $this->sockets[(int) $socket] = array(
+                        'server_id' => $server_id,
+                        'packet_type' => null,
+                        'socket' => $socket,
+                );
+                $this->serverIdToSocket[$server_id] = (int) $socket;
+            }
+            // Nothing to query? Strange...
+            if (empty($allPackets)) {
+                return TRUE;
+            }
+
+            // Write packets linear to sockets and get response
+            // Many linear servers just have one query, so this only runs once
+            while (!empty($allPackets)) {
+                $queryCounter = 0;
+                // First send all the packets
+                foreach ($allPackets as $server_id => $packetArray) {
+                    $packet_type = key($packetArray);
+                    $packet = $packetArray[$packet_type];
+                    unset($allPackets[$server_id][$packet_type]);
+                    if (empty($allPackets[$server_id]))
+                        unset($allPackets[$server_id]);
+                    // Add the socket information so we can retreive it easily
+                    $this->sockets[$this->serverIdToSocket[$server_id]]['packet_type'] = $packet_type;
+                    // Write the packet
+                    $written = fwrite($this->sockets[$this->serverIdToSocket[$server_id]]['socket'], $packet);
+                    usleep($this->packet_delay);
+                    $queryCounter++;
+                    if ($queryCounter > $this->max_concurrent_linear_queries) {
+                        break;
+                    }
+                }
+                // Now we need to listen for packet response(s)
+		$responses = $this->sockets_listen();
+		// Lets look at our responses
+		foreach($responses AS $socket_id => $response)
+		{
+                    // Back out the server_id
+                    $server_id = $this->sockets[$socket_id]['server_id'];
+
+                    // Back out the packet type
+                    $packet_type = $this->sockets[$socket_id]['packet_type'];
+
+                    // Save the response from this packet
+                    $this->servers[$server_id]->packetResponse($packet_type, $response);
+		}
+            }
+            $this->sockets_close();
+            return TRUE;
 	}
 
 	/* Sockets/streams stuff */
@@ -759,11 +814,10 @@ class GameQ
 		{
 			// Now lets listen for some streams, but do not cross the streams!
 			$streams = stream_select($read, $write, $except, 0, $this->stream_timeout);
-
 			// We had error or no streams left, kill the loop
 			if($streams === FALSE || ($streams <= 0))
 			{
-			    $loop_active = FALSE;
+                                $loop_active = FALSE;
 				break;
 			}
 
@@ -810,7 +864,7 @@ class GameQ
 		foreach($this->sockets AS $socket_id => $data)
 		{
 			fclose($data['socket']);
-			unset($this->sockets[$socket_id]);
+			unset($this->sockets[$socket_id], $this->serverIdToSocket[$data['server_id']]);
 		}
 
 		return TRUE;
