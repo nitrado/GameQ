@@ -131,13 +131,13 @@ class GameQ
 	 */
 	protected $options = array(
             'debug' => FALSE,
-            'timeout' => 3, // Seconds
+            'timeout' => 5, // Seconds
             'filters' => array(),
             
             // Advanced settings
             'stream_timeout' => 400000, // See http://www.php.net/manual/en/function.stream-select.php for more info
             'packet_delay' => 50000,
-            'max_concurrent_linear_queries' => 5,
+            'max_concurrent_linear_queries' => 25,
         );
 
 	/**
@@ -666,13 +666,14 @@ class GameQ
                 }
                 $allPackets[$server_id] = $packets;
                 // Check if we already have a socket open
-                if (isset($this->sockets[$this->serverIdToSocket[$server_id]])) {
+                if (isset($this->serverIdToSocket[$server_id]) && isset($this->sockets[$this->serverIdToSocket[$server_id]])) {
                     continue;
                 }
                 // Make a new socket
                 // This happens if the instance does not have a challenge
                 if(($socket = $this->socket_open($instance, TRUE)) === FALSE)
                 {
+//echo "Creating new Socket for" . $server_id . PHP_EOL;
                         // Skip it
                         continue;
                 }
@@ -704,6 +705,7 @@ class GameQ
                     $this->sockets[$this->serverIdToSocket[$server_id]]['packet_type'] = $packet_type;
                     // Write the packet
                     $written = fwrite($this->sockets[$this->serverIdToSocket[$server_id]]['socket'], $packet);
+//echo "Wrote $written bytes to " . $server_id . PHP_EOL;
                     usleep($this->packet_delay);
                     $queryCounter++;
                     if ($queryCounter > $this->max_concurrent_linear_queries) {
@@ -712,9 +714,14 @@ class GameQ
                 }
                 // Now we need to listen for packet response(s)
 		$responses = $this->sockets_listen();
+//echo sizeof($responses) . '/' . $queryCounter . ' responses received' . PHP_EOL;
 		// Lets look at our responses
 		foreach($responses AS $socket_id => $response)
 		{
+/*if (empty($response)) {
+echo $socket_id . ' empty response' . PHP_EOL;
+    $empty++;
+}*/
                     // Back out the server_id
                     $server_id = $this->sockets[$socket_id]['server_id'];
 
